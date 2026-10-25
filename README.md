@@ -4,6 +4,8 @@
 
 本仓库只上传代码、脚本和说明。数据、预训练权重、结果、本地虚拟环境均不提交。当前本地验证是小样本 CPU 流程测试，尚无完整数据训练后的效果结论。
 
+项目仅保留纯融合流程。训练入口为 `train_Fu.py`，推理为 `fuse.py`，评估为 `evaluate_fusion.py`，统一脚本为 `scripts/run.sh`。
+
 ## 1. 服务器安装
 
 ```bash
@@ -55,7 +57,7 @@ DATA_ROOT=/data/c2rf bash scripts/prepare_osdataset.sh
 DATA_ROOT=/data/c2rf RESOLUTION=512 DATASET_NAME=OSDataset512 bash scripts/prepare_osdataset.sh
 ```
 
-只验证代码时可设置 `LIMIT=4`。小样本与全量数据请用不同 `DATASET_NAME` 或 `DATA_ROOT`；转换脚本拒绝覆盖已经准备好的目录。256/512 来自相关原始影像，不能把不同版本混作独立训练/测试数据。val 划分保留用于后续调参；当前训练脚本不自动挑选验证集最优模型。
+只验证代码时可设置 `LIMIT=4`。小样本与全量数据请用不同 `DATA_ROOT`；转换脚本拒绝覆盖已经准备好的目录。数据集选项仅支持 RoadScene、OSDataset 和 OSDataset512。256/512 来自相关原始影像，不能把不同版本混作独立训练/测试数据。val 划分保留用于后续调参；当前训练脚本不自动挑选验证集最优模型。
 
 ### RoadScene 数据
 
@@ -72,7 +74,7 @@ bash scripts/run.sh smoke RoadScene
 bash scripts/run.sh smoke OSDataset
 ```
 
-CPU 环境用 `DEVICE=cpu`。`smoke` 验证真实数据加载和随机权重前向，不能当作模型效果评估。报告在 `result/<数据集>/<实验名>/smoke/report.json`。
+CPU 环境用 `DEVICE=cpu`。`smoke` 验证真实数据加载和随机权重前向，不能当作模型效果评估。报告在 `result/<数据集>/<实验名>/smoke/train-report.json` 和 `test-report.json`。
 
 完整的自动流程测试使用临时生成的图像，验证两个训练阶段、冻结参数、断点续训、权重加载、融合图片导出和评估：
 
@@ -154,18 +156,6 @@ EXPERIMENT=loss_v1 bash scripts/run.sh evaluate OSDataset
 ```
 
 建议先在 val 上筛选结构/损失，再固定方案评估 test；一次只改一个因素，保留 baseline 的 checkpoint、config 和指标。本仓库没有宣称某个改动已提高融合质量。
-
-## 7. 可选：原 C2RF 配准后融合
-
-`model.py`、`train_Reg.py` 和 `test.py` 保留为原论文配准路线。`test.py` 需要 `test/<数据集>/vi_warp` 和 `checkpoint/<数据集>/` 下的 `Encoder.pth`、`Decoder.pth`、`Fusion_layer.pth`、`RegNet.pth`：
-
-```bash
-bash scripts/run.sh reg-test RoadScene
-# 缺少合成 warp 时可显式生成；这会写入数据目录：
-bash scripts/run.sh reg-test RoadScene --generate_test_warp
-```
-
-RoadScene 权重不等同于训练好的光学–SAR 权重。当前主要验证和推荐运行路径是上面的纯融合流程。
 
 ## 来源与引用
 

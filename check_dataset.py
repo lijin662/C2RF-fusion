@@ -6,8 +6,7 @@ from options import TrainOptions
 if __name__ == '__main__':
     opts = TrainOptions().parse()
     split = 'train' if opts.phase == 'train' else 'test'
-    require_warp = split == 'test' and not opts.generate_test_warp
-    folders = dataset_folders(opts, split, require_warp=require_warp)
+    folders = dataset_folders(opts, split)
     names = paired_image_names(*folders)
     print('Dataset: %s' % opts.dataset)
     print('Split: %s' % split)

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Usage: bash scripts/run.sh {check|smoke|train|fuse|evaluate|reg-test} {RoadScene|OSDataset} [python options...]
+# Usage: bash scripts/run.sh {check|smoke|train|fuse|evaluate} {RoadScene|OSDataset} [python options...]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-action="${1:?Specify check, smoke, train, fuse, or reg-test}"
+action="${1:?Specify check, smoke, train, fuse, or evaluate}"
 dataset="${2:?Specify RoadScene or OSDataset}"
 shift 2
 PYTHON="${PYTHON:-.venv/bin/python}"
@@ -16,7 +16,7 @@ common=(--dataset "$dataset" --train_dataroot "$DATA_ROOT/train" --test_dataroot
 case "$action" in
   check)
     "$PYTHON" check_dataset.py "${common[@]}" --phase train "$@"
-    "$PYTHON" check_dataset.py "${common[@]}" --phase test --generate_test_warp "$@"
+    "$PYTHON" check_dataset.py "${common[@]}" --phase test "$@"
     ;;
   smoke)
     "$PYTHON" smoke_test.py "${common[@]}" --phase train "$@"
@@ -28,9 +28,6 @@ case "$action" in
   fuse)
     "$PYTHON" fuse.py "${common[@]}" \
       --fusion_checkpoint "$OUTPUT_ROOT/$dataset/$EXPERIMENT/latest.pt" "$@"
-    ;;
-  reg-test)
-    "$PYTHON" test.py "${common[@]}" "$@"
     ;;
   evaluate)
     "$PYTHON" evaluate_fusion.py "${common[@]}" "$@"

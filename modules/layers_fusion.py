@@ -138,9 +138,6 @@ class Inception(nn.Module):
         b1 = self.branch1(x)
         b2 = self.branch2(x)
 
-        grid = self.sobel(x)
-        grid = self.grid_conv(grid)
-
         # b = torch.cat([b1, b2, b3, grid], dim=1)
         # b = torch.cat([x, b1, b2, b3], dim=1)
         b = torch.cat([x,b0, b1, b2], dim=1)

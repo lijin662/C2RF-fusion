@@ -6,20 +6,27 @@
 
 项目仅保留纯融合流程。训练入口为 `train_Fu.py`，推理为 `fuse.py`，评估为 `evaluate_fusion.py`，统一脚本为 `scripts/run.sh`。
 
-## 1. 服务器安装
+## 1. RTX 5090 服务器安装
 
 ```bash
-git clone https://github.com/<你的GitHub用户名>/C2RF-fusion.git
+git clone https://github.com/lijin662/C2RF-fusion.git
 cd C2RF-fusion
-# 建议用 Python 3.11/3.12；PYTHON_BIN 可指定已安装的解释器。
-PYTHON_BIN=python3 bash scripts/setup_env.sh
+# 检查服务器能看到 5090；驱动由服务器管理员预先安装。
+nvidia-smi
+# 建议 Python 3.11；也可指定已有的 python3.12。
+PYTHON_BIN=python3.11 bash scripts/setup_5090.sh
 source .venv/bin/activate
-python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
+# BF16 是可选加速模式，先单独验证。
+python check_gpu.py --precision bf16
 ```
 
-安装脚本默认使用 pip 的 PyTorch 包。如果服务器需要特定 CUDA wheel，先根据驱动选择 PyTorch 官方提供的索引，再设置 `TORCH_INDEX_URL` 运行安装脚本；例如 `TORCH_INDEX_URL=<对应的官方索引URL> bash scripts/setup_env.sh`。正式训练前确认上面的 CUDA 检查输出 `True`。
+5090 属于 Blackwell，计算能力为 `sm_120`，需要支持它的 PyTorch CUDA 构建。专用脚本固定安装 **torch 2.11.0 + torchvision 0.26.0，CUDA 12.8 wheel**，避免误用 CPU、cu118、cu121 或 cu126 构建。版本组合来自 [PyTorch 官方安装表](https://pytorch.org/get-started/previous-versions/)，硬件架构见 [NVIDIA GPU 列表](https://developer.nvidia.com/cuda/gpus)。如果服务器已有兼容的更新 CUDA 12.8+/13.x PyTorch 环境，可以直接安装 `requirements.txt` 并执行 `check_gpu.py`，无需强制降级。
 
-本机 CPU 已验证的核心版本为 torch 2.14.1、torchvision 0.29.1、kornia 0.9.0。依赖范围见 [requirements.txt](requirements.txt)，Linux CUDA 环境需在服务器实际验证。
+`check_gpu.py` 会执行项目融合网络和损失的 CUDA 前向/反向并检查有限值，验证实际卷积内核可用；仅 `torch.cuda.is_available() == True` 不够。`setup_5090.sh` 已自动执行 FP32 检查，BF16 检查需显式运行。若提示 `sm_120` 不兼容或 `no kernel image`，先修复 PyTorch wheel/驱动，暂不启动正式训练。
+
+驱动必须支持 5090 和对应运行时；`nvidia-smi` 顶部的 CUDA Version 表示驱动支持上限，不是当前 Python 的 PyTorch CUDA 版本。预编译 wheel 已附带运行依赖，本项目没有自定义 CUDA 扩展，一般不需另外安装系统 CUDA Toolkit。通用 CPU/MPS 环境仍可用 `PYTHON_BIN=python3 bash scripts/setup_env.sh`。
+
+本机 CPU 已验证核心版本为 torch 2.14.1、torchvision 0.29.1、kornia 0.9.0。依赖范围见 [requirements.txt](requirements.txt)。5090 安装方案已按官方文档配置，尚未在本机实测 GPU；以服务器上的检查结果为准。
 
 ## 2. 数据放置
 
@@ -84,6 +91,21 @@ python -m unittest discover -s tests -v
 
 ## 4. 分别训练两个融合模型
 
+第一次先做真实的两阶段短跑：保留正式的 256 裁剪，每个阶段仅跑一批，检查峰值显存和耗时。
+
+```bash
+export DATA_ROOT=/data/c2rf
+export DEVICE=cuda
+export BATCH_SIZE=2
+export WORKERS=4
+EXPERIMENT=5090-check bash scripts/run.sh train RoadScene \
+  --n_ep_Fu 2 --warmup_epochs 1 --max_steps 1
+EXPERIMENT=5090-check bash scripts/run.sh train OSDataset \
+  --n_ep_Fu 2 --warmup_epochs 1 --max_steps 1
+```
+
+短跑通过后换成正式实验名、去掉缩短训练的参数。先用 FP32 跑 baseline：
+
 ```bash
 export DATA_ROOT=/data/c2rf
 export DEVICE=cuda
@@ -95,6 +117,21 @@ bash scripts/run.sh train OSDataset
 ```
 
 上面两条命令顺序执行；单张卡建议分别训练。默认总共 150 epoch：前 50 epoch 预训练 Encoder/Decoder，后 100 epoch 冻结它们、训练 Fusion_layer。AFF 中的全局 BatchNorm 要求训练 batch size 至少为 2，训练会丢弃最后一个不足 batch 的批次。训练随机裁剪为 256；推理保留原始尺寸。
+
+5090 的 batch size 从 2 开始，观察两个阶段的峰值显存，再尝试 4 或 8；这里的 batch 值是调参起点，没有声称已经完成 5090 显存测试。不同 batch size 会影响训练结果，确定后请在同一对比实验中固定。
+
+### 可选 BF16 混合精度
+
+完成 `python check_gpu.py --precision bf16` 后，可以使用独立实验名测试 BF16：
+
+```bash
+EXPERIMENT=bf16-check bash scripts/run.sh train OSDataset \
+  --precision bf16 --n_ep_Fu 2 --warmup_epochs 1 --max_steps 1
+# 正式 BF16 训练
+EXPERIMENT=baseline-bf16 bash scripts/run.sh train OSDataset --precision bf16
+```
+
+BF16 仅用于模型前向，SSIM、相关性和梯度损失保持 FP32。默认仍为 `--precision fp32`，BF16 的速度、显存收益和效果需在服务器对比，不与 FP32 结果混为同一实验。
 
 快速检查两个训练阶段，可以缩短为：
 
@@ -110,7 +147,9 @@ EXPERIMENT=quickcheck bash scripts/run.sh train OSDataset \
 ```text
 result/OSDataset/baseline/
 ├── config.json              # 超参数和数据路径
+├── environment.json         # Python/PyTorch/CUDA/GPU/精度
 ├── loss.csv                 # 每轮平均训练损失
+├── performance.csv          # 每轮训练耗时、GPU 峰值 allocated 显存
 ├── latest.pt                # 每轮保存，可续训
 ├── epoch_0150.pt            # 定期/最后的完整快照
 ├── Encoder.pth              # 进入融合阶段后导出的独立组件
@@ -118,10 +157,13 @@ result/OSDataset/baseline/
 └── Fusion_layer.pth
 ```
 
-续训必须保持原有总 epoch、warmup、batch size、crop size、学习率和种子等参数：
+续训必须保持原有总 epoch、warmup、batch size、crop size、学习率、种子和 precision 等参数：
 
 ```bash
 bash scripts/run.sh train OSDataset --resume result/OSDataset/baseline/latest.pt
+# BF16 实验续训也需要显式带上相同精度：
+EXPERIMENT=baseline-bf16 bash scripts/run.sh train OSDataset --precision bf16 \
+  --resume result/OSDataset/baseline-bf16/latest.pt
 ```
 
 已存在实验不会被无意覆盖。完整 checkpoint 包含模型、优化器、学习率调度器和随机状态，按 epoch 边界恢复。生产运行可使用 tmux，或：
@@ -131,6 +173,10 @@ mkdir -p logs
 nohup bash scripts/run.sh train OSDataset > logs/osdataset-baseline.log 2>&1 &
 tail -f logs/osdataset-baseline.log
 ```
+
+训练日志会报告每轮耗时和峰值 allocated GPU 显存，`nvidia-smi` 还包含缓存/其他进程占用，两者数值不必一致。中途断电或 Ctrl+C 后从最近一次完整 epoch 的 `latest.pt` 恢复；不是从中断 batch 恢复。精确复现测试目前覆盖 CPU + `nThreads=0`，不保证不同 GPU、库版本或多进程数据加载之间逐位相同。
+
+常见问题：显存不足时先保持 batch≥2、使用 BF16 或独立实验降低 crop；DataLoader/shared memory 报错时用 `WORKERS=0` 排查；单张卡不要同时开两个正式训练进程。首次只使用少量数据做了准备时，另选 `DATA_ROOT` 重新准备全量，检查数据对数是否与上表相符。
 
 ## 5. 融合推理与对比
 

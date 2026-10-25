@@ -2,6 +2,9 @@
 import csv
 import json
 import random
+import platform
+import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import kornia
@@ -26,6 +29,12 @@ def main(opts):
         raise ValueError('display_freq and model_save_freq must be positive.')
     seed_everything(opts.seed)
     device = resolve_device(opts.device, opts.gpu)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    use_bf16 = opts.precision == 'bf16'
+    if use_bf16 and (device.type != 'cuda' or torch.cuda.get_device_capability(device)[0] < 8
+                     or not torch.cuda.is_bf16_supported()):
+        raise ValueError('--precision bf16 requires a CUDA GPU with native BF16 support.')
     destination = Path(opts.output_dir) / opts.dataset / opts.experiment
     if (destination / 'latest.pt').exists() and not opts.resume:
         raise FileExistsError('Use --resume or a new --experiment: %s' % destination)
@@ -47,6 +56,8 @@ def main(opts):
     start_epoch = 0
     if opts.resume:
         saved = load_checkpoint(opts.resume, device)
+        if saved['options'].get('precision', 'fp32') != opts.precision:
+            raise ValueError('Resume requires the same --precision as the checkpoint.')
         for key in ['dataset', 'warmup_epochs', 'n_ep_Fu', 'crop_size', 'lr', 'batch_size', 'seed']:
             if saved['options'][key] != getattr(opts, key):
                 raise ValueError('Resume requires original --%s=%s' % (key, saved['options'][key]))
@@ -63,6 +74,14 @@ def main(opts):
         if device.type == 'cuda' and 'cuda' in rng:
             torch.cuda.set_rng_state_all([state.cpu() for state in rng['cuda']])
     (destination / 'config.json').write_text(json.dumps(vars(opts), indent=2) + '\n')
+    environment = {'python': platform.python_version(), 'torch': str(torch.__version__),
+                   'kornia': kornia.__version__, 'cuda_runtime': torch.version.cuda,
+                   'device': str(device), 'precision': opts.precision}
+    if device.type == 'cuda':
+        environment.update({'gpu': torch.cuda.get_device_name(device),
+                            'capability': list(torch.cuda.get_device_capability(device)),
+                            'cudnn': torch.backends.cudnn.version()})
+    (destination / 'environment.json').write_text(json.dumps(environment, indent=2) + '\n')
     reconstruction_ssim = kornia.losses.SSIMLoss(11, reduction='mean').to(device)
     fusion_loss = Fusionloss().to(device)
     mse, l1 = nn.MSELoss(), nn.L1Loss()
@@ -70,6 +89,9 @@ def main(opts):
           (device, opts.dataset, len(data), destination), flush=True)
 
     for epoch in range(start_epoch, opts.n_ep_Fu):
+        started = time.perf_counter()
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats(device)
         stage = 'reconstruction' if epoch < opts.warmup_epochs else 'fusion'
         model.train()
         if stage == 'fusion':
@@ -77,12 +99,16 @@ def main(opts):
         active = ['encoder', 'decoder'] if stage == 'reconstruction' else ['fusion']
         total, count = 0., 0
         for step, (ir, vi, _, _, _) in enumerate(loader):
-            ir, vi = ir.squeeze(1).to(device), vi.squeeze(1).to(device)
+            ir = ir.squeeze(1).to(device, non_blocking=device.type == 'cuda')
+            vi = vi.squeeze(1).to(device, non_blocking=device.type == 'cuda')
             for optimizer in optimizers.values():
                 optimizer.zero_grad(set_to_none=True)
             if stage == 'reconstruction':
-                _, i2, ib, id_, _, v2, vb, vd = model.encoder(ir, vi)
-                recon_ir, recon_vi = model.decoder(ib, id_, i2), model.decoder(vb, vd, v2)
+                with torch.autocast('cuda', dtype=torch.bfloat16) if use_bf16 else nullcontext():
+                    _, i2, ib, id_, _, v2, vb, vd = model.encoder(ir, vi)
+                    recon_ir, recon_vi = model.decoder(ib, id_, i2), model.decoder(vb, vd, v2)
+                recon_ir, recon_vi = recon_ir.float(), recon_vi.float()
+                ib, id_, vb, vd = ib.float(), id_.float(), vb.float(), vd.float()
                 decomposition = cc(vd, id_) - cc(vb, ib) + torch.tanh(l1(ib, vb))
                 loss = 5 * (5 * reconstruction_ssim(vi, recon_vi) + mse(vi, recon_vi))
                 loss = loss + 5 * (5 * reconstruction_ssim(ir, recon_ir) + mse(ir, recon_ir))
@@ -91,7 +117,9 @@ def main(opts):
                                          kornia.filters.spatial_gradient(reconstructed))
                 loss = loss + 0.01 * decomposition
             else:
-                loss, _, _, _ = fusion_loss(vi, ir, model(ir, vi))
+                with torch.autocast('cuda', dtype=torch.bfloat16) if use_bf16 else nullcontext():
+                    fused = model(ir, vi)
+                loss, _, _, _ = fusion_loss(vi, ir, fused.float())
             if not torch.isfinite(loss):
                 raise RuntimeError('Non-finite loss at epoch %d, batch %d' % (epoch + 1, step + 1))
             loss.backward()
@@ -109,6 +137,12 @@ def main(opts):
                 break
         for key in active:
             schedulers[key].step()
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+        peak_gib = torch.cuda.max_memory_allocated(device) / 1024 ** 3 if device.type == 'cuda' else 0.
+        print('Epoch %d completed | %.1fs | peak allocated GPU memory %.2f GiB' %
+              (epoch + 1, elapsed, peak_gib), flush=True)
         np_state = np.random.get_state()
         rng = {'torch': torch.get_rng_state(), 'python': random.getstate(),
                'numpy_keys': np_state[1].tolist(), 'numpy_pos': np_state[2],
@@ -134,6 +168,13 @@ def main(opts):
             if empty:
                 writer.writerow(['epoch', 'stage', 'loss', 'batches'])
             writer.writerow([epoch + 1, stage, total / count, count])
+        performance = destination / 'performance.csv'
+        empty = not performance.exists()
+        with performance.open('a', newline='') as handle:
+            writer = csv.writer(handle)
+            if empty:
+                writer.writerow(['epoch', 'seconds', 'peak_allocated_gpu_gib'])
+            writer.writerow([epoch + 1, elapsed, peak_gib])
     print('Training finished: %s' % (destination / 'latest.pt'), flush=True)
 
 

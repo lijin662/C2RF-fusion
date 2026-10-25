@@ -25,6 +25,8 @@ class TrainOptions:
         add('--resume', default=None)
         add('--gpu', type=int, default=0)
         add('--device', default='auto', choices=['auto', 'cpu', 'cuda', 'mps'])
+        add('--precision', default='fp32', choices=['fp32', 'bf16'],
+            help='bf16 uses CUDA autocast for model forwards; losses remain float32')
         add('--checkpoint_dir', default='./checkpoint', help='directory of per-dataset fusion component weights')
         add('--fusion_checkpoint', default=None)
         add('--output_dir', default='./result')

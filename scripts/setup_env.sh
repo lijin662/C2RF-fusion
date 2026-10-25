@@ -6,7 +6,9 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 .venv/bin/python -m pip install --upgrade pip
 # Set TORCH_INDEX_URL to the PyTorch wheel index matching the server driver.
 if [[ -n "${TORCH_INDEX_URL:-}" ]]; then
-  .venv/bin/python -m pip install torch torchvision --index-url "$TORCH_INDEX_URL"
+  torch_package="torch${TORCH_VERSION:+==$TORCH_VERSION}"
+  vision_package="torchvision${TORCHVISION_VERSION:+==$TORCHVISION_VERSION}"
+  .venv/bin/python -m pip install --upgrade "$torch_package" "$vision_package" --index-url "$TORCH_INDEX_URL"
 fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -c 'import torch; print("PyTorch:", torch.__version__); print("CUDA:", torch.cuda.is_available())'
